@@ -1149,11 +1149,6 @@ func (c *Controller) gcChassis() error {
 	c.gcChassisMu.Lock()
 	defer c.gcChassisMu.Unlock()
 
-	// The isChassisExempt checks below are the only GC exemption in this
-	// file; it exists so an externally-managed (non-k8s) gateway chassis
-	// survives both this periodic GC and a controller restart. There is
-	// no equivalent exemption for LSP GC above.
-
 	klog.Infof("start to gc chassis")
 	chassises, err := c.OVNSbClient.ListChassis()
 	if err != nil {
@@ -1162,6 +1157,16 @@ func (c *Controller) gcChassis() error {
 	}
 	chassisNodes := make(map[string]string, len(*chassises))
 	for _, chassis := range *chassises {
+		if c.config.EnableExternalVpc && (chassis.ExternalIDs == nil || chassis.ExternalIDs["vendor"] != util.CniTypeName) {
+			// Under --enable-external-vpc, restrict chassis GC to chassis
+			// kube-ovn itself tagged vendor=kube-ovn (every k8s node's
+			// chassis, stamped by UpdateChassisTag). An untagged chassis is
+			// externally managed (e.g. a non-k8s KVM hypervisor bridged
+			// into this OVN deployment) and must never be considered for
+			// deletion here, matching the same vendor filter already
+			// applied to LSP/LS/LR GC under this flag.
+			continue
+		}
 		chassisNodes[chassis.Name] = chassis.Hostname
 	}
 	nodes, err := c.nodesLister.List(labels.Everything())
@@ -1181,11 +1186,6 @@ func (c *Controller) gcChassis() error {
 				delete(chassisNodes, chassisName)
 				continue
 			}
-			if c.isChassisExempt(chassisName) {
-				klog.Infof("skip gc of exempted chassis %s (hostname mismatch for node %s)", chassisName, node.Name)
-				delete(chassisNodes, chassisName)
-				continue
-			}
 			// maybe node name changed, delete chassis
 			klog.Infof("gc node %s chassis %s", node.Name, chassisName)
 			if err := c.OVNSbClient.DeleteChassis(chassisName); err != nil {
@@ -1196,10 +1196,6 @@ func (c *Controller) gcChassis() error {
 	}
 
 	for chassisName, hostname := range chassisNodes {
-		if c.isChassisExempt(chassisName) {
-			klog.Infof("skip gc of exempted chassis %s (host %s)", chassisName, hostname)
-			continue
-		}
 		klog.Infof("gc node %s chassis %s", hostname, chassisName)
 		if err := c.OVNSbClient.DeleteChassis(chassisName); err != nil {
 			klog.Errorf("failed to delete node %s chassis %s %v", hostname, chassisName, err)
