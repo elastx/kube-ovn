@@ -913,3 +913,54 @@ func TestGcNodeKeepsPolicyAdoptedBySameNameReplacement(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, remaining, 1, "the policy of a same-name replacement node must survive gc")
 }
+
+func TestMarkAndCleanLSPKeepsVipLSPs(t *testing.T) {
+	subnet := &kubeovnv1.Subnet{
+		Name: "subnet-a",
+		Spec: kubeovnv1.SubnetSpec{CIDRBlock: "10.0.0.0/24", Provider: util.OvnProvider},
+	}
+	// legacy is a vip left over from the removed kube_host_vm_vip type. Nothing recreates
+	// its lsp (handleAddVirtualIP returns early for an already provisioned vip, see
+	// needsSwitchLBRuleMacRepair), so gc must keep it until the vip itself is deleted.
+	legacy := &kubeovnv1.Vip{
+		Name: "legacy",
+		Spec: kubeovnv1.VipSpec{Type: "kube_host_vm_vip", Subnet: subnet.Name, Namespace: "default"},
+	}
+	slr := &kubeovnv1.Vip{
+		Name: "slr",
+		Spec: kubeovnv1.VipSpec{Type: util.SwitchLBRuleVip, Subnet: subnet.Name, Namespace: "default"},
+	}
+	// an aap vip is backed by a virtual lsp, which ListNormalLogicalSwitchPorts never returns
+	aap := &kubeovnv1.Vip{
+		Name: "aap",
+		Spec: kubeovnv1.VipSpec{Subnet: subnet.Name, Namespace: "default"},
+	}
+	fakeController, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Subnets: []*kubeovnv1.Subnet{subnet},
+		Vips:    []*kubeovnv1.Vip{legacy, slr, aap},
+	})
+	require.NoError(t, err)
+
+	ctrl := fakeController.fakeController
+	ctrl.config.EnableKeepVMIP = false
+	ctrl.addNodeQueue = newTypedRateLimitingQueue[string]("AddNode", nil)
+
+	legacyLsp := ovs.PodNameToPortName(legacy.Name, legacy.Spec.Namespace, util.OvnProvider)
+	slrLsp := ovs.PodNameToPortName(slr.Name, slr.Spec.Namespace, util.OvnProvider)
+	orphanLsp := ovs.PodNameToPortName("orphan", "default", util.OvnProvider)
+
+	// second gc round: every lsp was already seen without a pod
+	previousLastNoPodLSP := lastNoPodLSP
+	lastNoPodLSP = strset.New(legacyLsp, slrLsp, orphanLsp)
+	t.Cleanup(func() { lastNoPodLSP = previousLastNoPodLSP })
+
+	fakeController.mockOvnClient.EXPECT().ListNormalLogicalSwitchPorts(false, nil).Return([]ovnnb.LogicalSwitchPort{
+		{Name: legacyLsp}, {Name: slrLsp}, {Name: orphanLsp},
+	}, nil)
+	// only the orphan is reclaimed: neither vip lsp may be deleted
+	fakeController.mockOvnClient.EXPECT().DeleteLogicalSwitchPort(legacyLsp).Times(0)
+	fakeController.mockOvnClient.EXPECT().DeleteLogicalSwitchPort(slrLsp).Times(0)
+	fakeController.mockOvnClient.EXPECT().DeleteLogicalSwitchPort(orphanLsp).Return(nil)
+
+	require.NoError(t, ctrl.markAndCleanLSP())
+}

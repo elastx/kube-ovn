@@ -49,7 +49,6 @@ func (c *Controller) gc() error {
 		c.gcVpcNatGateway,
 		c.gcLogicalRouterPort,
 		c.gcIP,
-		c.gcVip,
 		c.gcLbSvcPods,
 		c.gcVPCDNS,
 		c.gcRouterLBRules,
@@ -299,42 +298,6 @@ func (c *Controller) gcStaleNodeRouterPolicy(owner string, policy *ovnnb.Logical
 	return nil
 }
 
-func (c *Controller) gcVip() error {
-	klog.Infof("start to gc vips")
-	selector, err := util.LabelSelectorNotEmpty(util.IPReservedLabel)
-	if err != nil {
-		klog.Errorf("failed to generate selector for label %s: %v", util.IPReservedLabel, err)
-		return err
-	}
-	vips, err := c.virtualIpsLister.List(selector)
-	if err != nil {
-		klog.Errorf("failed to list vips: %v", err)
-		return err
-	}
-	for _, vip := range vips {
-		portName := vip.Labels[util.IPReservedLabel]
-		portNameSplits := strings.Split(portName, ".")
-		if len(portNameSplits) >= 2 {
-			podName := portNameSplits[0]
-			namespace := portNameSplits[1]
-			_, err := c.podsLister.Pods(namespace).Get(podName)
-			if err != nil {
-				if k8serrors.IsNotFound(err) {
-					if _, err = c.releaseVip(vip.Name); err != nil {
-						klog.Errorf("failed to clean label from vip %s, %v", vip.Name, err)
-						return err
-					}
-					continue
-				}
-				klog.Error(err)
-				return err
-			}
-		}
-	}
-	klog.Infof("finish to gc vips")
-	return nil
-}
-
 func (c *Controller) checkIPOwnerExists(ip *kubeovnv1.IP) (bool, error) {
 	// Check if Subnet exists
 	if _, ok := c.ipam.Subnets[ip.Spec.Subnet]; !ok {
@@ -520,6 +483,9 @@ func (c *Controller) markAndCleanLSP() error {
 	}
 	vipsMap := strset.NewWithSize(len(vips))
 	for _, vip := range vips {
+		// a vip with a non empty type is backed by a normal lsp: switch_lb_rule creates one,
+		// and a vip left over from the removed kube_host_vm_vip type still has the one that
+		// was created for it. Neither is replaced by anything, so gc must not reclaim them.
 		if vip.Spec.Type != "" {
 			subnetName := vip.Spec.Subnet
 			if subnetName == "" {
@@ -551,7 +517,7 @@ func (c *Controller) markAndCleanLSP() error {
 			continue
 		}
 		if vipsMap.Has(lsp.Name) {
-			// skip gc lsp for k8s host network vm pod or switch lb rule
+			// skip gc lsp for switch lb rule or a legacy kube_host_vm_vip
 			continue
 		}
 		if !lastNoPodLSP.Has(lsp.Name) {
