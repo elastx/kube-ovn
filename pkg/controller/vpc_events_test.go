@@ -6,6 +6,7 @@ import (
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktesting "k8s.io/client-go/testing"
@@ -16,6 +17,7 @@ import (
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
 	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -112,8 +114,56 @@ func TestHandleDeleteVpcDeletesU2OOverlayCIDRsAddressSets(t *testing.T) {
 	fc.mockOvnClient.EXPECT().DeleteLogicalRouter(vpc.Name).Return(nil)
 	v4Name, v6Name := u2oOverlayCIDRsAddressSetNames(vpc.Name)
 	fc.mockOvnClient.EXPECT().DeleteAddressSet(v4Name, v6Name).Return(nil)
+	fc.mockOvnClient.EXPECT().DeleteLoadBalancers(gomock.Any()).Return(nil)
 
 	require.NoError(t, ctrl.handleDelVpc(vpc))
+}
+
+func TestHandleDeleteVpcDeletesVpcLoadBalancers(t *testing.T) {
+	t.Parallel()
+
+	vpc := &kubeovnv1.Vpc{
+		Name:   "deleted-vpc",
+		Status: kubeovnv1.VpcStatus{Router: "deleted-vpc"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Vpcs: []*kubeovnv1.Vpc{vpc}})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+	ctrl.vpcLastPoliciesMap = xsync.NewMap[string, string]()
+	ctrl.config.ExternalGatewaySwitch = "external"
+
+	fc.mockOvnClient.EXPECT().RemoveLogicalPatchPort("external-deleted-vpc", "deleted-vpc-external").Return(nil)
+	fc.mockOvnClient.EXPECT().DeleteBFDByDstIP("deleted-vpc-external", "").Return(nil)
+	fc.mockOvnClient.EXPECT().DeleteLogicalRouter(vpc.Name).Return(nil)
+	fc.mockOvnClient.EXPECT().DeleteAddressSet(gomock.Any(), gomock.Any()).Return(nil)
+	fc.mockOvnClient.EXPECT().DeleteLoadBalancers(gomock.Any()).DoAndReturn(func(filter func(*ovnnb.LoadBalancer) bool) error {
+		kubeOvn := map[string]string{"vendor": util.CniTypeName}
+		for _, name := range []string{
+			"vpc-deleted-vpc-tcp-load",
+			"vpc-deleted-vpc-tcp-sess-load",
+			"vpc-deleted-vpc-udp-load",
+			"vpc-deleted-vpc-udp-sess-load",
+			"vpc-deleted-vpc-sctp-load",
+			"vpc-deleted-vpc-sctp-sess-load",
+		} {
+			require.True(t, filter(&ovnnb.LoadBalancer{Name: name, ExternalIDs: kubeOvn}), name)
+		}
+		require.False(t, filter(&ovnnb.LoadBalancer{Name: "vpc-deleted-vpc-tcp-load", ExternalIDs: map[string]string{"vendor": "external"}}))
+		require.False(t, filter(&ovnnb.LoadBalancer{Name: "vpc-other-vpc-tcp-load", ExternalIDs: kubeOvn}))
+		require.False(t, filter(&ovnnb.LoadBalancer{Name: "cluster-tcp-loadbalancer", ExternalIDs: kubeOvn}))
+		return nil
+	})
+
+	require.NoError(t, ctrl.handleDelVpc(vpc))
+}
+
+func TestDeleteVpcLoadBalancersSkipsDefaultVpc(t *testing.T) {
+	t.Parallel()
+
+	fc := newFakeController(t)
+
+	// no DeleteLoadBalancers call is expected for the default vpc
+	require.NoError(t, fc.fakeController.deleteVpcLoadBalancers(util.DefaultVpc))
 }
 
 func TestHandleAddOrUpdateVpcNatGatewayRecordsFailureEvent(t *testing.T) {

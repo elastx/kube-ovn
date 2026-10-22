@@ -166,6 +166,11 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) (retErr error) {
 		return err
 	}
 
+	if err := c.deleteVpcLoadBalancers(vpc.Name); err != nil {
+		klog.Error(err)
+		return err
+	}
+
 	return nil
 }
 
@@ -268,6 +273,22 @@ func (c *Controller) GenVpcLoadBalancer(vpcKey string) *VpcLoadBalancer {
 		SctpLoadBalancer:     fmt.Sprintf("vpc-%s-sctp-load", vpcKey),
 		SctpSessLoadBalancer: fmt.Sprintf("vpc-%s-sctp-sess-load", vpcKey),
 	}
+}
+
+// deleteVpcLoadBalancers deletes the per-VPC load balancers created for a
+// custom VPC. The cluster load balancers of the default VPC are never deleted.
+func (c *Controller) deleteVpcLoadBalancers(vpcName string) error {
+	if vpcName == c.config.ClusterRouter || vpcName == "" {
+		return nil
+	}
+	vpcLb := c.GenVpcLoadBalancer(vpcName)
+	lbs := []string{vpcLb.TCPLoadBalancer, vpcLb.TCPSessLoadBalancer, vpcLb.UDPLoadBalancer, vpcLb.UDPSessLoadBalancer, vpcLb.SctpLoadBalancer, vpcLb.SctpSessLoadBalancer}
+	if err := c.OVNNbClient.DeleteLoadBalancers(func(lb *ovnnb.LoadBalancer) bool {
+		return lb.ExternalIDs["vendor"] == util.CniTypeName && slices.Contains(lbs, lb.Name)
+	}); err != nil {
+		return fmt.Errorf("delete load balancers of vpc %s: %w", vpcName, err)
+	}
+	return nil
 }
 
 func (c *Controller) handleAddOrUpdateVpc(key string) (retErr error) {
