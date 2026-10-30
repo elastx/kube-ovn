@@ -2,10 +2,13 @@ package controller
 
 import (
 	"errors"
+	"maps"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,6 +18,8 @@ import (
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
 	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/ovs"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnsb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -114,5 +119,189 @@ func TestResyncExternalGatewayRepairsVpcStatus(t *testing.T) {
 			require.Equal(t, enabled, got.Spec.EnableExternal)
 			require.Equal(t, enabled, got.Status.EnableExternal)
 		})
+	}
+}
+
+func newExternalGatewayTestController(t *testing.T, exGwNodes string) *fakeController {
+	t.Helper()
+
+	// resyncExternalGateway keeps its state in package variables
+	oldEnabled, oldCM := exGwEnabled, lastExGwCM
+	t.Cleanup(func() { exGwEnabled, lastExGwCM = oldEnabled, oldCM })
+
+	nodes := []*corev1.Node{
+		{Name: "node-1", Annotations: map[string]string{util.ChassisAnnotation: "chassis-1"}},
+		{Name: "node-2", Annotations: map[string]string{util.ChassisAnnotation: "chassis-2"}},
+		{Name: "node-3"},
+	}
+	cm := &corev1.ConfigMap{
+		Name:      util.ExternalGatewayConfig,
+		Namespace: metav1.NamespaceSystem,
+		Data:      externalGatewayConfig(exGwNodes),
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:       []*kubeovnv1.Vpc{{Name: util.DefaultVpc}},
+		Nodes:      nodes,
+		ConfigMaps: []*corev1.ConfigMap{cm},
+	})
+	require.NoError(t, err)
+	fc.fakeController.config.ExternalGatewayConfigNS = metav1.NamespaceSystem
+	fc.fakeController.config.ExternalGatewaySwitch = util.ExternalGatewaySwitch
+	fc.fakeController.config.ExternalGatewayNet = "external"
+	return fc
+}
+
+func externalGatewayConfig(exGwNodes string) map[string]string {
+	return map[string]string{
+		"enable-external-gw": "true",
+		"type":               kubeovnv1.GWCentralizedType,
+		"external-gw-nodes":  exGwNodes,
+		"nic-ip":             "172.56.0.2/16",
+		"nic-mac":            "00:00:00:12:34:56",
+	}
+}
+
+func updateExternalGatewayConfig(t *testing.T, fc *fakeController, exGwNodes string) {
+	t.Helper()
+
+	c := fc.fakeController
+	cms := c.config.KubeClient.CoreV1().ConfigMaps(metav1.NamespaceSystem)
+	cm, err := cms.Get(t.Context(), util.ExternalGatewayConfig, metav1.GetOptions{})
+	require.NoError(t, err)
+	cm.Data = externalGatewayConfig(exGwNodes)
+	_, err = cms.Update(t.Context(), cm, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		cached, err := c.configMapsLister.ConfigMaps(metav1.NamespaceSystem).Get(util.ExternalGatewayConfig)
+		return err == nil && maps.Equal(cached.Data, cm.Data)
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func expectGetChassis(fc *fakeController) {
+	fc.mockOvnSbClient.EXPECT().GetChassis(gomock.Any(), false).DoAndReturn(
+		func(name string, _ bool) (*ovnsb.Chassis, error) {
+			return &ovnsb.Chassis{Name: name}, nil
+		},
+	).AnyTimes()
+}
+
+func useInMemoryNbForExternalGateway(t *testing.T, c *Controller) *ovs.OVNNbClient {
+	t.Helper()
+
+	nb := newInMemoryOVNNbClient(t)
+	c.OVNNbClient = nb
+	c.OVNNbTables = nb
+	require.NoError(t, nb.CreateLogicalRouter(util.DefaultVpc))
+	return nb
+}
+
+func requireExternalGatewayChassis(t *testing.T, nb *ovs.OVNNbClient, chassises ...string) {
+	t.Helper()
+
+	lrpName := util.DefaultVpc + "-" + util.ExternalGatewaySwitch
+	lrp, err := nb.GetLogicalRouterPort(lrpName, true)
+	require.NoError(t, err)
+	if len(chassises) == 0 {
+		require.Nil(t, lrp)
+		return
+	}
+	require.NotNil(t, lrp)
+	gwChassises, err := nb.ListGatewayChassisByLogicalRouterPort(lrpName, false)
+	require.NoError(t, err)
+	names := make([]string, 0, len(gwChassises))
+	for _, gwChassis := range gwChassises {
+		names = append(names, gwChassis.ChassisName)
+	}
+	require.ElementsMatch(t, chassises, names)
+}
+
+func TestResyncExternalGatewayRetriesAfterFailedEstablish(t *testing.T) {
+	fc := newExternalGatewayTestController(t, "node-1,node-3")
+	c := fc.fakeController
+	expectGetChassis(fc)
+	nb := useInMemoryNbForExternalGateway(t, c)
+
+	// the gateway was established on node-1 and node-2
+	require.NoError(t, c.establishExternalGateway(externalGatewayConfig("node-1,node-2")))
+	exGwEnabled = "true"
+	lastExGwCM = externalGatewayConfig("node-1,node-2")
+	requireExternalGatewayChassis(t, nb, "chassis-1", "chassis-2")
+
+	// node-2 is replaced by node-3, which is not ready yet
+	c.resyncExternalGateway()
+	requireExternalGatewayChassis(t, nb)
+
+	// node-3 is replaced by node-2 again
+	updateExternalGatewayConfig(t, fc, "node-1,node-2")
+	c.resyncExternalGateway()
+	requireExternalGatewayChassis(t, nb, "chassis-1", "chassis-2")
+	require.Equal(t, "true", exGwEnabled)
+}
+
+func TestResyncExternalGatewayRetriesAfterFailedRemove(t *testing.T) {
+	fc := newExternalGatewayTestController(t, "node-1,node-3")
+	c := fc.fakeController
+	expectGetChassis(fc)
+	nb := useInMemoryNbForExternalGateway(t, c)
+
+	require.NoError(t, c.establishExternalGateway(externalGatewayConfig("node-1,node-2")))
+	exGwEnabled = "true"
+	lastExGwCM = externalGatewayConfig("node-1,node-2")
+	require.Eventually(t, func() bool {
+		nodes, err := c.nodesLister.List(externalGatewayNodeSelector)
+		return err == nil && len(nodes) == 2
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// the remove unlabels one gateway node and fails on the other
+	patches := 0
+	fc.kubeClient.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		if patches++; patches == 2 {
+			return true, nil, errors.New("temporary patch failure")
+		}
+		return false, nil, nil
+	})
+	c.resyncExternalGateway()
+	require.Equal(t, 2, patches)
+
+	// the config is changed back, so the gateway must be established again
+	updateExternalGatewayConfig(t, fc, "node-1,node-2")
+	c.resyncExternalGateway()
+	require.Equal(t, "true", exGwEnabled)
+	requireExternalGatewayChassis(t, nb, "chassis-1", "chassis-2")
+	for _, name := range []string{"node-1", "node-2"} {
+		node, err := c.config.KubeClient.CoreV1().Nodes().Get(t.Context(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "true", node.Labels[util.ExGatewayLabel], "node %s", name)
+	}
+}
+
+func TestGetGatewayChassisDoesNotLabelNodesOnFailure(t *testing.T) {
+	fc := newExternalGatewayTestController(t, "node-1,node-3")
+	c := fc.fakeController
+	expectGetChassis(fc)
+
+	_, err := c.getGatewayChassis(externalGatewayConfig("node-1,node-3"))
+	require.ErrorContains(t, err, "node node-3 has no chassis annotation")
+
+	for _, name := range []string{"node-1", "node-3"} {
+		node, err := c.config.KubeClient.CoreV1().Nodes().Get(t.Context(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.NotContains(t, node.Labels, util.ExGatewayLabel, "node %s", name)
+	}
+}
+
+func TestGetGatewayChassisLabelsNodes(t *testing.T) {
+	fc := newExternalGatewayTestController(t, "node-1,node-2")
+	c := fc.fakeController
+	expectGetChassis(fc)
+
+	chassises, err := c.getGatewayChassis(externalGatewayConfig("node-1,node-2"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"chassis-1", "chassis-2"}, chassises)
+
+	for _, name := range []string{"node-1", "node-2"} {
+		node, err := c.config.KubeClient.CoreV1().Nodes().Get(t.Context(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "true", node.Labels[util.ExGatewayLabel], "node %s", name)
 	}
 }
