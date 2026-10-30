@@ -74,12 +74,18 @@ func (c *Controller) resyncExternalGateway() {
 		klog.Info("external gw nodes list changed, start to remove ovn external gw")
 		if err := c.removeExternalGateway(); err != nil {
 			klog.Errorf("failed to remove old ovn external gw, %v", err)
+			// the gateway may have been partially removed, retry on next resync
+			exGwEnabled = "unknown"
 			return
 		}
 	}
 	klog.Info("start to establish ovn external gw")
 	if err := c.establishExternalGateway(cm.Data); err != nil {
 		klog.Errorf("failed to establish ovn-external-gw, %v", err)
+		// record the config that failed, so that the next resync retries it,
+		// or removes what it left behind if the config is changed again
+		exGwEnabled = "unknown"
+		lastExGwCM = cm.Data
 		return
 	}
 	exGwEnabled = "true"
@@ -250,12 +256,6 @@ func (c *Controller) getGatewayChassis(config map[string]string) ([]string, erro
 			klog.Errorf("failed to get gw node %s, %v", gw, err)
 			return nil, err
 		}
-		patch := util.KVPatch{util.ExGatewayLabel: "true"}
-		if err = util.PatchLabels(c.config.KubeClient.CoreV1().Nodes(), node.Name, patch); err != nil {
-			klog.Errorf("failed to patch annotations of node %s: %v", node.Name, err)
-			return nil, err
-		}
-
 		annoChassisName := node.Annotations[util.ChassisAnnotation]
 		if annoChassisName == "" {
 			err := fmt.Errorf("node %s has no chassis annotation, kube-ovn-cni not ready", gw)
@@ -274,6 +274,14 @@ func (c *Controller) getGatewayChassis(config map[string]string) ([]string, erro
 		err := errors.New("no available external gw chassis")
 		klog.Error(err)
 		return nil, err
+	}
+	// label the nodes only after all of them have a chassis
+	for _, gw := range gwNodes {
+		patch := util.KVPatch{util.ExGatewayLabel: "true"}
+		if err = util.PatchLabels(c.config.KubeClient.CoreV1().Nodes(), gw, patch); err != nil {
+			klog.Errorf("failed to patch annotations of node %s: %v", gw, err)
+			return nil, err
+		}
 	}
 	return chassises, nil
 }
