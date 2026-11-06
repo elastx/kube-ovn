@@ -45,6 +45,8 @@ func (c *Controller) enqueueUpdateOvnDnatRule(oldObj, newObj any) {
 	if oldDnat.Spec.OvnEip != newDnat.Spec.OvnEip ||
 		oldDnat.Spec.Protocol != newDnat.Spec.Protocol ||
 		oldDnat.Spec.IPName != newDnat.Spec.IPName ||
+		oldDnat.Spec.V4Ip != newDnat.Spec.V4Ip ||
+		oldDnat.Spec.V6Ip != newDnat.Spec.V6Ip ||
 		oldDnat.Spec.InternalPort != newDnat.Spec.InternalPort ||
 		oldDnat.Spec.ExternalPort != newDnat.Spec.ExternalPort {
 		klog.Infof("enqueue update dnat %s", key)
@@ -409,8 +411,9 @@ func (c *Controller) handleUpdateOvnDnatRule(key string) error {
 		klog.Error(err)
 		return err
 	}
-	if internalV4Ip != cachedDnat.Status.V4Ip || internalV6Ip != cachedDnat.Status.V6Ip {
-		err := fmt.Errorf("not support change internal ip for dnat %s", cachedDnat.Name)
+	internalIPChanged := internalV4Ip != cachedDnat.Status.V4Ip || internalV6Ip != cachedDnat.Status.V6Ip
+	if internalIPChanged && ((internalV4Ip == "") != (cachedDnat.Status.V4Ip == "") || (internalV6Ip == "") != (cachedDnat.Status.V6Ip == "")) {
+		err := fmt.Errorf("not support change ip family of internal ip for dnat %s", cachedDnat.Name)
 		klog.Error(err)
 		return err
 	}
@@ -431,6 +434,27 @@ func (c *Controller) handleUpdateOvnDnatRule(key string) error {
 	}
 	if err := c.checkEipPortConflict(eipName, cachedDnat.Spec.ExternalPort, "", key); err != nil {
 		klog.Errorf("failed to update dnat %s, %v", cachedDnat.Name, err)
+		return err
+	}
+	if !internalIPChanged {
+		return nil
+	}
+
+	klog.Infof("dnat %s internal ip changed from %q/%q to %q/%q", key, cachedDnat.Status.V4Ip, cachedDnat.Status.V6Ip, internalV4Ip, internalV6Ip)
+	if internalV4Ip != "" && v4Eip != "" {
+		if err = c.AddDnatRule(vpcName, cachedDnat.Name, v4Eip, internalV4Ip, cachedDnat.Spec.ExternalPort, cachedDnat.Spec.InternalPort, cachedDnat.Spec.Protocol); err != nil {
+			klog.Errorf("failed to update v4 dnat, %v", err)
+			return err
+		}
+	}
+	if internalV6Ip != "" && v6Eip != "" {
+		if err = c.AddDnatRule(vpcName, cachedDnat.Name, v6Eip, internalV6Ip, cachedDnat.Spec.ExternalPort, cachedDnat.Spec.InternalPort, cachedDnat.Spec.Protocol); err != nil {
+			klog.Errorf("failed to update v6 dnat, %v", err)
+			return err
+		}
+	}
+	if err = c.patchOvnDnatStatus(key, vpcName, v4Eip, v6Eip, internalV4Ip, internalV6Ip, true); err != nil {
+		klog.Errorf("failed to patch status for dnat %s, %v", key, err)
 		return err
 	}
 	return nil
