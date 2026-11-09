@@ -371,9 +371,12 @@ func (suite *OvnClientTestSuite) testDeleteNat() {
 		require.Empty(t, lr.Nat)
 	})
 
-	t.Run("failed client delete dnat_and_snat from logical router", func(t *testing.T) {
+	t.Run("delete dnat_and_snat from logical router that does not exist", func(t *testing.T) {
+		// the logical router does not exist on this client
 		err = failedNbClient.DeleteNat(lrName, "dnat_and_snat", externalIP, logicalIP)
-		require.Error(t, err)
+		require.NoError(t, err)
+		err = failedNbClient.DeleteNat(lrName, "dnat_and_snat", externalIP, "")
+		require.NoError(t, err)
 	})
 
 	t.Run("failed client delete invalid nat from logical router", func(t *testing.T) {
@@ -382,8 +385,6 @@ func (suite *OvnClientTestSuite) testDeleteNat() {
 		require.Error(t, err)
 		// empty
 		err = failedNbClient.DeleteNat(lrName, "dnat_and_snat", "", logicalIP)
-		require.Error(t, err)
-		err = failedNbClient.DeleteNat(lrName, "dnat_and_snat", externalIP, "")
 		require.Error(t, err)
 		err = failedNbClient.DeleteNat("", "dnat_and_snat", externalIP, logicalIP)
 		require.Error(t, err)
@@ -416,6 +417,28 @@ func (suite *OvnClientTestSuite) testDeleteNatIsIdempotent() {
 	require.NoError(t, nbClient.AddNat(lrName, ovnnb.NATTypeDNATAndSNAT, eip, logicalIP, "00:00:00:cc:cc:cc", "pod-c.ns", nil))
 	require.NoError(t, nbClient.DeleteNat(lrName, ovnnb.NATTypeDNATAndSNAT, eip, logicalIP))
 	require.NoError(t, nbClient.DeleteNat(lrName, ovnnb.NATTypeDNATAndSNAT, eip, logicalIP))
+}
+
+func (suite *OvnClientTestSuite) testDeleteNatWithDeletedLogicalRouter() {
+	t := suite.T()
+	t.Parallel()
+	nbClient := suite.ovnNBClient
+	lrName := "test-lr-nat-del-deleted-lr"
+	eip := "192.168.31.101"
+	logicalIP := "10.16.0.0/24"
+
+	require.NoError(t, nbClient.CreateLogicalRouter(lrName))
+	require.NoError(t, nbClient.AddNat(lrName, ovnnb.NATTypeSNAT, eip, logicalIP, "", "", nil))
+	require.NoError(t, nbClient.DeleteLogicalRouter(lrName))
+
+	// the nat is gone together with the logical router
+	require.NoError(t, nbClient.DeleteNat(lrName, ovnnb.NATTypeSNAT, eip, logicalIP))
+	exists, err := nbClient.NatExists(lrName, ovnnb.NATTypeSNAT, eip, logicalIP)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	_, err = nbClient.GetNat(lrName, ovnnb.NATTypeSNAT, eip, logicalIP, false)
+	require.ErrorContains(t, err, "not found logical router")
 }
 
 func (suite *OvnClientTestSuite) testDeleteNats() {
@@ -695,9 +718,11 @@ func (suite *OvnClientTestSuite) testNewNat() {
 	t.Run("fail to new snat rule", func(t *testing.T) {
 		t.Parallel()
 
-		// failed client new nat
-		_, err := failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")
-		require.Error(t, err)
+		// the logical router does not exist on this client: the nat can be
+		// built, but not added to the router
+		nat, err := failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")
+		require.NoError(t, err)
+		require.ErrorContains(t, failedNbClient.CreateNats(lrName, nat), "not found logical router")
 		// invalid nat type
 		natType := "dnat"
 		_, err = failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")
@@ -716,9 +741,11 @@ func (suite *OvnClientTestSuite) testNewNat() {
 	t.Run("fail to new snat rule", func(t *testing.T) {
 		t.Parallel()
 
-		// failed client new nat
-		_, err := failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")
-		require.Error(t, err)
+		// the logical router does not exist on this client: the nat can be
+		// built, but not added to the router
+		nat, err := failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")
+		require.NoError(t, err)
+		require.ErrorContains(t, failedNbClient.CreateNats(lrName, nat), "not found logical router")
 		// invalid nat type
 		natType := "dnat"
 		_, err = failedNbClient.newNat(lrName, natType, externalIP, logicalIP, "", "")

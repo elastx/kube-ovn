@@ -314,6 +314,17 @@ func (c *OVNNbClient) GetNat(lrName, natType, externalIP, logicalIP string, igno
 			return nil, err
 		}
 	}
+	if ignoreNotFound {
+		// the nats of a logical router are deleted together with it
+		lr, err := c.GetLogicalRouter(lrName, true)
+		if err != nil {
+			klog.Error(err)
+			return nil, err
+		}
+		if lr == nil {
+			return nil, nil
+		}
+	}
 
 	fnFilter := func(nat *ovnnb.NAT) bool {
 		if natType == "" {
