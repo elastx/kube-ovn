@@ -953,6 +953,10 @@ func (suite *OvnClientTestSuite) Test_DeleteNatIsIdempotent() {
 	suite.testDeleteNatIsIdempotent()
 }
 
+func (suite *OvnClientTestSuite) Test_DeleteNatWithDeletedLogicalRouter() {
+	suite.testDeleteNatWithDeletedLogicalRouter()
+}
+
 func (suite *OvnClientTestSuite) Test_GetNat() {
 	suite.testGetNat()
 }
