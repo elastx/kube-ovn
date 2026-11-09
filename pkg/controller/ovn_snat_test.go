@@ -140,3 +140,37 @@ func TestHandleUpdateOvnSnatRule_DeleteToleratesMissingNat(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, got.Finalizers, util.KubeOVNControllerFinalizer)
 }
+
+func TestHandleUpdateOvnSnatRule_DeleteToleratesDeletedVpcRouter(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.Now()
+	snat := &kubeovnv1.OvnSnatRule{
+		Name:              "test-snat",
+		Finalizers:        []string{util.KubeOVNControllerFinalizer},
+		DeletionTimestamp: &now,
+		Spec:              kubeovnv1.OvnSnatRuleSpec{OvnEip: "test-eip", Vpc: "test-vpc", V4IpCidr: "10.0.1.0/24"},
+	}
+	snat.Status = kubeovnv1.OvnSnatRuleStatus{
+		Vpc:      "test-vpc",
+		V4Eip:    "10.0.0.10",
+		V4IpCidr: "10.0.1.0/24",
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{OvnSnatRules: []*kubeovnv1.OvnSnatRule{snat}})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+	ctrl.resetOvnEipQueue = newTypedRateLimitingQueue[string]("ResetOvnEip", nil)
+	t.Cleanup(ctrl.resetOvnEipQueue.ShutDown)
+	ctrl.updateOvnEipQueue = newTypedRateLimitingQueue[string]("UpdateOvnEip", nil)
+	t.Cleanup(ctrl.updateOvnEipQueue.ShutDown)
+
+	// the vpc and its logical router were deleted before the snat
+	ctrl.OVNNbClient = newInMemoryOVNNbClient(t)
+
+	require.NoError(t, ctrl.handleUpdateOvnSnatRule(snat.Name))
+
+	got, err := ctrl.config.KubeOvnClient.KubeovnV1().OvnSnatRules().Get(t.Context(), snat.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotContains(t, got.Finalizers, util.KubeOVNControllerFinalizer)
+}
