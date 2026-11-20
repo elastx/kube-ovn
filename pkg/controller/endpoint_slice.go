@@ -335,6 +335,28 @@ func (c *Controller) replaceEndpointAddressesWithSecondaryIPs(endpointSlices []*
 			}
 		}
 	}
+
+	// getSecondaryIP returns the secondary IP of the same family as address,
+	// if address is one of the pod's primary IPs. On a dual-stack cluster the
+	// endpoint slice of each family holds the pod's primary IP of that family,
+	// and only one of them is pod.Status.PodIP.
+	getSecondaryIP := func(pod *v1.Pod, secondaryIP, address string) string {
+		isPrimary := address == pod.Status.PodIP
+		for _, podIP := range pod.Status.PodIPs {
+			if address == podIP.IP {
+				isPrimary = true
+				break
+			}
+		}
+		if !isPrimary {
+			return ""
+		}
+		v4IP, v6IP := util.SplitStringIP(secondaryIP)
+		if util.CheckProtocol(address) == kubeovnv1.ProtocolIPv6 {
+			return v6IP
+		}
+		return v4IP
+	}
 	// Process each endpoint slice
 	for i, endpoint := range endpointSlices {
 		var copiedSlice *discoveryv1.EndpointSlice
@@ -353,20 +375,20 @@ func (c *Controller) replaceEndpointAddressesWithSecondaryIPs(endpointSlices []*
 					if pod, ok := podMap[podName]; ok {
 						// Check if any address needs replacement
 						for k, address := range ep.Addresses {
-							// Only replace if it's the primary IP
-							if address == pod.Status.PodIP {
+							// Only replace if it's a primary IP of the pod, with the secondary IP of the same family
+							if newIP := getSecondaryIP(pod, secondaryIP, address); newIP != "" {
 								// Lazy deep copy
 								if !needsUpdate {
 									copiedSlice = endpoint.DeepCopy()
 									needsUpdate = true
 								}
 								klog.Infof("updating pod %s/%s ip address %s to %s",
-									pod.Namespace, pod.Name, pod.Status.PodIP, secondaryIP)
-								copiedSlice.Endpoints[j].Addresses[k] = secondaryIP
+									pod.Namespace, pod.Name, address, newIP)
+								copiedSlice.Endpoints[j].Addresses[k] = newIP
 								processedPods[podKey] = true
 								// Only one primary IP per endpoint
 								break
-							} else if address == secondaryIP {
+							} else if v4IP, v6IP := util.SplitStringIP(secondaryIP); address == secondaryIP || address == v4IP || address == v6IP {
 								// Already has secondary IP, mark as processed
 								processedPods[podKey] = true
 								break
