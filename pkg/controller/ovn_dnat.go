@@ -544,13 +544,13 @@ func (c *Controller) patchOvnDnatStatus(key, vpcName, v4Eip, v6Eip, internalV4Ip
 		needUpdateLabel = true
 		dnat.Labels = map[string]string{
 			util.EipV4IpLabel: v4Eip,
-			util.EipV6IpLabel: v6Eip,
+			util.EipV6IpLabel: util.IPv6ToLabelValue(v6Eip),
 		}
-	} else if dnat.Labels[util.EipV4IpLabel] != v4Eip || dnat.Labels[util.EipV6IpLabel] != v6Eip {
+	} else if dnat.Labels[util.EipV4IpLabel] != v4Eip || dnat.Labels[util.EipV6IpLabel] != util.IPv6ToLabelValue(v6Eip) {
 		op = "replace"
 		needUpdateLabel = true
 		dnat.Labels[util.EipV4IpLabel] = v4Eip
-		dnat.Labels[util.EipV6IpLabel] = v6Eip
+		dnat.Labels[util.EipV6IpLabel] = util.IPv6ToLabelValue(v6Eip)
 	}
 	if needUpdateLabel {
 		patchPayloadTemplate := `[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`
