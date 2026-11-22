@@ -490,6 +490,183 @@ func TestReplaceEndpointAddressesWithSecondaryIPs(t *testing.T) {
 			description: "Should replace primary IP with secondary IP from first provider",
 		},
 		{
+			name: "Replace primary IPv4 address of an IPv6 primary pod with IPv4 secondary IP",
+			endpointSlices: []*discoveryv1.EndpointSlice{
+				{
+					Name:        "test-service-slice-v4",
+					Namespace:   "default",
+					AddressType: discoveryv1.AddressTypeIPv4,
+					Endpoints: []discoveryv1.Endpoint{
+						{
+							Addresses: []string{"10.244.0.5"}, // Primary IPv4 address, not pod.Status.PodIP
+							TargetRef: &corev1.ObjectReference{
+								Kind: util.KindPod,
+								Name: "test-pod-1",
+							},
+						},
+					},
+				},
+				{
+					Name:        "test-service-slice-v6",
+					Namespace:   "default",
+					AddressType: discoveryv1.AddressTypeIPv6,
+					Endpoints: []discoveryv1.Endpoint{
+						{
+							Addresses: []string{"fd00:10:244::5"}, // pod.Status.PodIP
+							TargetRef: &corev1.ObjectReference{
+								Kind: util.KindPod,
+								Name: "test-pod-1",
+							},
+						},
+					},
+				},
+			},
+			pods: []*corev1.Pod{
+				{
+					Name:      "test-pod-1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						nadv1.NetworkAttachmentAnnot:                                          `[{"name": "net1"}]`,
+						fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, "net1.default.ovn"): "net1-subnet",
+						fmt.Sprintf(util.LogicalRouterAnnotationTemplate, "net1.default.ovn"): "net1-vpc",
+						fmt.Sprintf(util.IPAddressAnnotationTemplate, "net1.default.ovn"):     "192.168.1.10",
+					},
+					Status: corev1.PodStatus{
+						PodIP: "fd00:10:244::5",
+						PodIPs: []corev1.PodIP{
+							{IP: "fd00:10:244::5"},
+							{IP: "10.244.0.5"},
+						},
+					},
+				},
+			},
+			networkAttachments: []*nadv1.NetworkAttachmentDefinition{
+				{
+					Name:      "net1",
+					Namespace: "default",
+					Spec: nadv1.NetworkAttachmentDefinitionSpec{
+						Config: `{
+							"cniVersion": "0.3.1",
+							"name": "net1",
+							"type": "kube-ovn",
+							"server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+							"provider": "net1.default.ovn"
+						}`,
+					},
+				},
+			},
+			subnets: []*kubeovnv1.Subnet{
+				{
+					Name: "net1-subnet",
+					Spec: kubeovnv1.SubnetSpec{
+						CIDRBlock: "192.168.1.0/24",
+						Provider:  "net1.default.ovn",
+					},
+				},
+				{
+					Name: "ovn-default",
+					Spec: kubeovnv1.SubnetSpec{
+						CIDRBlock: "10.244.0.0/24,fd00:10:244::/64",
+						Provider:  util.OvnProvider,
+					},
+				},
+			},
+			expectedChanges: map[string]string{
+				"10.244.0.5": "192.168.1.10",
+			},
+			expectError: false,
+			description: "Should replace the IPv4 address in the IPv4 slice and leave the IPv6 slice unchanged, as the secondary IP has no IPv6 address",
+		},
+		{
+			name: "Replace primary IPs of an IPv6 primary pod with dual-stack secondary IPs",
+			endpointSlices: []*discoveryv1.EndpointSlice{
+				{
+					Name:        "test-service-slice-v4",
+					Namespace:   "default",
+					AddressType: discoveryv1.AddressTypeIPv4,
+					Endpoints: []discoveryv1.Endpoint{
+						{
+							Addresses: []string{"10.244.0.5"}, // Primary IPv4 address, not pod.Status.PodIP
+							TargetRef: &corev1.ObjectReference{
+								Kind: util.KindPod,
+								Name: "test-pod-1",
+							},
+						},
+					},
+				},
+				{
+					Name:        "test-service-slice-v6",
+					Namespace:   "default",
+					AddressType: discoveryv1.AddressTypeIPv6,
+					Endpoints: []discoveryv1.Endpoint{
+						{
+							Addresses: []string{"fd00:10:244::5"}, // pod.Status.PodIP
+							TargetRef: &corev1.ObjectReference{
+								Kind: util.KindPod,
+								Name: "test-pod-1",
+							},
+						},
+					},
+				},
+			},
+			pods: []*corev1.Pod{
+				{
+					Name:      "test-pod-1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						nadv1.NetworkAttachmentAnnot:                                          `[{"name": "net1"}]`,
+						fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, "net1.default.ovn"): "net1-subnet",
+						fmt.Sprintf(util.LogicalRouterAnnotationTemplate, "net1.default.ovn"): "net1-vpc",
+						fmt.Sprintf(util.IPAddressAnnotationTemplate, "net1.default.ovn"):     "192.168.1.10,fd00:192:168:1::10",
+					},
+					Status: corev1.PodStatus{
+						PodIP: "fd00:10:244::5",
+						PodIPs: []corev1.PodIP{
+							{IP: "fd00:10:244::5"},
+							{IP: "10.244.0.5"},
+						},
+					},
+				},
+			},
+			networkAttachments: []*nadv1.NetworkAttachmentDefinition{
+				{
+					Name:      "net1",
+					Namespace: "default",
+					Spec: nadv1.NetworkAttachmentDefinitionSpec{
+						Config: `{
+							"cniVersion": "0.3.1",
+							"name": "net1",
+							"type": "kube-ovn",
+							"server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+							"provider": "net1.default.ovn"
+						}`,
+					},
+				},
+			},
+			subnets: []*kubeovnv1.Subnet{
+				{
+					Name: "net1-subnet",
+					Spec: kubeovnv1.SubnetSpec{
+						CIDRBlock: "192.168.1.0/24,fd00:192:168:1::/64",
+						Provider:  "net1.default.ovn",
+					},
+				},
+				{
+					Name: "ovn-default",
+					Spec: kubeovnv1.SubnetSpec{
+						CIDRBlock: "10.244.0.0/24,fd00:10:244::/64",
+						Provider:  util.OvnProvider,
+					},
+				},
+			},
+			expectedChanges: map[string]string{
+				"10.244.0.5":     "192.168.1.10",
+				"fd00:10:244::5": "fd00:192:168:1::10",
+			},
+			expectError: false,
+			description: "Should replace each primary IP with the secondary IP of the same family",
+		},
+		{
 			name: "Replace primary IP with secondary IP from network attachment with format <namespace>/<name>",
 			endpointSlices: []*discoveryv1.EndpointSlice{
 				{
