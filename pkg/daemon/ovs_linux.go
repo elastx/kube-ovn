@@ -238,7 +238,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 	// wait for the ovs interface to be ready
 	var ready bool
 	ch := make(chan struct{}, 1)
-	timeout := 30 * time.Second
+	timeout := csh.Config.OvsIfaceReadyTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	wait.Until(func() {
 		if time.Now().After(deadline) {

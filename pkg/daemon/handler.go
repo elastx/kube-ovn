@@ -39,11 +39,41 @@ type cniServerHandler struct {
 	KubeClient    kubernetes.Interface
 	KubeOvnClient clientset.Interface
 	Controller    *Controller
+	// nicSlots bounds concurrent configure-nic calls (nil: unbounded). When a
+	// node takes ~150 pods at once, every pod's OVS port raced for
+	// ovn-installed, none got it within the wait, and each retry's teardown
+	// and re-add kept ovs-vswitchd stalled: no port came up for 30+ min.
+	nicSlots chan struct{}
 }
 
 func createCniServerHandler(config *Configuration, controller *Controller) *cniServerHandler {
 	csh := &cniServerHandler{KubeClient: config.KubeClient, KubeOvnClient: config.KubeOvnClient, Config: config, Controller: controller}
+	if config.MaxConcurrentNic > 0 {
+		csh.nicSlots = make(chan struct{}, config.MaxConcurrentNic)
+	}
 	return csh
+}
+
+// acquireNicSlot blocks until a configure-nic slot is free, ctx ends or
+// NicQueueTimeout passes, and returns its release. Without a cap it
+// returns at once. The queue bound keeps queue + ovn-installed wait below
+// kubelet's runtime request timeout, so no slot works for a caller that has
+// already given up.
+func (csh cniServerHandler) acquireNicSlot(ctx context.Context) (func(), error) {
+	if csh.nicSlots == nil {
+		return func() {}, nil
+	}
+	if d := csh.Config.NicQueueTimeout; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	select {
+	case csh.nicSlots <- struct{}{}:
+		return func() { <-csh.nicSlots }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for a configure-nic slot (%d in use): %w", cap(csh.nicSlots), ctx.Err())
+	}
 }
 
 func podForCNIEvent(pod *v1.Pod, podRequest *request.CniRequest) *v1.Pod {
@@ -448,7 +478,14 @@ func (csh cniServerHandler) handleAdd(req *restful.Request, resp *restful.Respon
 			err = csh.configureDpdkNic(podRequest.PodName, podRequest.PodNamespace, podRequest.Provider, podRequest.NetNs, podRequest.ContainerID, ifName, macAddr, mtu, ipAddr, gw, ingress, egress, getShortSharedDir(pod.UID, podRequest.VhostUserSocketVolumeName), podRequest.VhostUserSocketName, podRequest.VhostUserSocketConsumption)
 			routes = nil
 		default:
-			routes, err = csh.configureNic(podRequest.PodName, podRequest.PodNamespace, podRequest.Provider, podRequest.NetNs, podRequest.ContainerID, podRequest.VfDriver, ifName, macAddr, mtu, ipAddr, gw, isDefaultRoute, vmMigration, routes, podRequest.DNS.Nameservers, podRequest.DNS.Search, ingress, egress, podRequest.DeviceID, latency, limit, loss, jitter, gatewayCheckMode, u2oInterconnectionIP, oldPodName, encapIP, appendIfName)
+			routes, err = func() ([]request.Route, error) {
+				release, err := csh.acquireNicSlot(req.Request.Context())
+				if err != nil {
+					return nil, err
+				}
+				defer release()
+				return csh.configureNic(podRequest.PodName, podRequest.PodNamespace, podRequest.Provider, podRequest.NetNs, podRequest.ContainerID, podRequest.VfDriver, ifName, macAddr, mtu, ipAddr, gw, isDefaultRoute, vmMigration, routes, podRequest.DNS.Nameservers, podRequest.DNS.Search, ingress, egress, podRequest.DeviceID, latency, limit, loss, jitter, gatewayCheckMode, u2oInterconnectionIP, oldPodName, encapIP, appendIfName)
+			}()
 		}
 		if err != nil {
 			errMsg := fmt.Errorf("configure nic %s for pod %s/%s failed: %w", ifName, podRequest.PodName, podRequest.PodNamespace, err)

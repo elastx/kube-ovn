@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
@@ -249,6 +250,110 @@ func TestCreateOrUpdateOvnEipCRPatchesOnlyMissingAllocation(t *testing.T) {
 			updated, err := client.KubeovnV1().OvnEips().Get(t.Context(), eip.Name, metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, eip.Status, updated.Status)
+		})
+	}
+}
+
+// requireValidLabels fails on any label value the API server would refuse;
+// the fake clientset does not validate metadata.
+func requireValidLabels(t *testing.T, labels map[string]string) {
+	t.Helper()
+	for k, v := range labels {
+		require.Empty(t, validation.IsValidLabelValue(v), "label %s=%q", k, v)
+	}
+}
+
+// An IPv6 (or dual-stack) OVN EIP must carry valid label values: the raw
+// address has colons, which the API server refuses, so a VPC router port on an
+// IPv6 external subnet was never created (upstream issue #6643).
+func TestCreateOrUpdateOvnEipCRIPv6Labels(t *testing.T) {
+	for _, tt := range []struct {
+		name, v4, v6, label string
+	}{
+		{name: "IPv6", v6: "2a07:2183:1ff::7", label: "2a07-2183-1ff--7"},
+		{name: "IPv6 trailing zeros", v6: "fd00:100::", label: "fd00-100--0"},
+		{name: "dual stack", v4: "172.19.0.17", v6: "fd00::17", label: "fd00--17"},
+		{name: "IPv4", v4: "172.19.0.17", label: ""},
+	} {
+		t.Run("create/"+tt.name, func(t *testing.T) {
+			c, client := newOvnEipStatusTestController(t, nil, nil)
+			require.NoError(t, c.createOrUpdateOvnEipCR("lrp-eip", "external-v6", tt.v4, tt.v6, "fa:7c:96:7b:1a:58", util.OvnEipTypeLRP))
+			eip, err := client.KubeovnV1().OvnEips().Get(t.Context(), "lrp-eip", metav1.GetOptions{})
+			require.NoError(t, err)
+			requireValidLabels(t, eip.Labels)
+			require.Equal(t, tt.label, eip.Labels[util.EipV6IpLabel])
+			require.Equal(t, tt.v6, eip.Spec.V6Ip)
+		})
+		t.Run("update/"+tt.name, func(t *testing.T) {
+			eip := &kubeovnv1.OvnEip{
+				Name: "lrp-eip",
+				Spec: kubeovnv1.OvnEipSpec{V4Ip: tt.v4, MacAddress: "fa:7c:96:7b:1a:58", Type: util.OvnEipTypeLRP},
+			}
+			c, client := newOvnEipStatusTestController(t, eip.DeepCopy(), eip)
+			require.NoError(t, c.createOrUpdateOvnEipCR("lrp-eip", "external-v6", tt.v4, tt.v6, "fa:7c:96:7b:1a:58", util.OvnEipTypeLRP))
+			updated, err := client.KubeovnV1().OvnEips().Get(t.Context(), "lrp-eip", metav1.GetOptions{})
+			require.NoError(t, err)
+			if tt.v6 != "" {
+				requireValidLabels(t, updated.Labels)
+				require.Equal(t, tt.label, updated.Labels[util.EipV6IpLabel])
+			}
+		})
+	}
+}
+
+func TestGetOvnEipNatByFamily(t *testing.T) {
+	// NAT rules always carry an eip_v4_ip label, so a pure-IPv6 rule still has
+	// eip_v4_ip="" together with its own eip_v6_ip label.
+	rule := func(name, v4, v6 string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Labels: map[string]string{
+			util.EipV4IpLabel: v4, util.EipV6IpLabel: util.IPv6ToLabelValue(v6),
+		}}
+	}
+	ipv6Dnat := &kubeovnv1.OvnDnatRule{ObjectMeta: rule("dnat-v6", "", "fc00:1::a")}
+	ipv6Snat := &kubeovnv1.OvnSnatRule{ObjectMeta: rule("snat-v6", "", "fc00:1::a")}
+	ipv4Dnat := &kubeovnv1.OvnDnatRule{ObjectMeta: rule("dnat-v4", "192.168.0.5", "")}
+	ipv4Fip := &kubeovnv1.OvnFip{ObjectMeta: rule("fip-v4", "192.168.0.5", "")}
+
+	newC := func(t *testing.T, objs ...any) *Controller {
+		t.Helper()
+		dnats := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		fips := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		snats := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		for _, o := range objs {
+			switch o.(type) {
+			case *kubeovnv1.OvnDnatRule:
+				require.NoError(t, dnats.Add(o))
+			case *kubeovnv1.OvnFip:
+				require.NoError(t, fips.Add(o))
+			case *kubeovnv1.OvnSnatRule:
+				require.NoError(t, snats.Add(o))
+			}
+		}
+		return &Controller{
+			ovnDnatRulesLister: kubeovnlisters.NewOvnDnatRuleLister(dnats),
+			ovnFipsLister:      kubeovnlisters.NewOvnFipLister(fips),
+			ovnSnatRulesLister: kubeovnlisters.NewOvnSnatRuleLister(snats),
+		}
+	}
+	for _, tt := range []struct {
+		name   string
+		objs   []any
+		v4, v6 string
+		want   string
+	}{
+		// Regression: {eip_v4_ip: ""} matched every IPv6-only NAT rule, so a
+		// pure-IPv6 EIP was always "in use" and could never be deleted.
+		{"pure IPv6 EIP ignores unrelated IPv6 NAT", []any{ipv6Dnat, ipv6Snat}, "", "fc00:1::7", ""},
+		{"pure IPv6 EIP matches its own NAT", []any{ipv6Dnat, ipv6Snat}, "", "fc00:1::a", util.DnatUsingEip + "," + util.SnatUsingEip},
+		{"IPv4 EIP matches its NAT", []any{ipv4Dnat, ipv4Fip}, "192.168.0.5", "", util.DnatUsingEip + "," + util.FipUsingEip},
+		{"IPv4 EIP ignores another v4", []any{ipv4Dnat}, "192.168.0.99", "", ""},
+		{"dual-stack EIP matches either family", []any{ipv4Dnat, ipv6Snat}, "192.168.0.5", "fc00:1::a", util.DnatUsingEip + "," + util.SnatUsingEip},
+		{"EIP with no ip queries nothing", []any{ipv6Dnat}, "", "", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			nat, err := newC(t, tt.objs...).getOvnEipNat(tt.v4, tt.v6)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, nat)
 		})
 	}
 }

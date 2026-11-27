@@ -98,6 +98,13 @@ type Configuration struct {
 	NodeNetworks      map[string]string
 	nodeNetworksMutex sync.RWMutex
 	DefaultEncapIP    string
+
+	// configure-nic back-pressure (foundation #511): a node taking ~150 pods
+	// at once timed out every OVS port at 30 s, and the teardown/retry churn
+	// kept the rtnl lock contended so no port came up for 30+ min.
+	OvsIfaceReadyTimeout time.Duration // wait for ovn-installed on the pod's OVS port
+	MaxConcurrentNic     int           // configure-nic calls at once on this node (0: no cap)
+	NicQueueTimeout      time.Duration // wait for a configure-nic slot
 }
 
 // ParseFlags will parse cmd args then init kubeClient and configuration
@@ -156,6 +163,11 @@ func ParseFlags() *Configuration {
 		argEnableACLSampling       = pflag.Bool("enable-acl-sampling", false, "Enable experimental local ACL sample delivery")
 		argACLSamplingSetID        = pflag.Uint32("acl-sampling-set-id", aclsampling.DefaultSetID, "Observation domain ID used by ACL sample collectors")
 		argACLSamplingLocalGroupID = pflag.Uint32("acl-sampling-local-group-id", aclsampling.DefaultLocalGroupID, "Local psample group ID used to deliver ACL samples")
+
+		// queue + ready wait must stay below kubelet's runtime-request-timeout (2m)
+		argOvsIfaceReadyTimeout = pflag.Duration("ovs-interface-ready-timeout", 90*time.Second, "How long configure-nic waits for ovn-installed on the pod's OVS port before failing the CNI ADD")
+		argMaxConcurrentNic     = pflag.Int("max-concurrent-configure-nic", 16, "The most configure-nic calls run at once on this node; the rest queue (0: no cap)")
+		argNicQueueTimeout      = pflag.Duration("configure-nic-queue-timeout", 25*time.Second, "How long a CNI ADD waits for a configure-nic slot before failing")
 	)
 
 	// mute info log for ipset lib
@@ -197,6 +209,9 @@ func ParseFlags() *Configuration {
 		SecureServing:             *argSecureServing,
 		PprofPort:                 *argPprofPort,
 		MacLearningFallback:       *argMacLearningFallback,
+		OvsIfaceReadyTimeout:      *argOvsIfaceReadyTimeout,
+		MaxConcurrentNic:          *argMaxConcurrentNic,
+		NicQueueTimeout:           *argNicQueueTimeout,
 		NodeName:                  os.Getenv(util.EnvNodeName),
 		PodNamespace:              os.Getenv(util.EnvPodNamespace),
 		PodName:                   os.Getenv(util.EnvPodName),
